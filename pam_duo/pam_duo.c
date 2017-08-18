@@ -316,12 +316,24 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
             break;
         }
         else if (strcmp(auth->ok.auth.status, "fraud") == 0) {
-                /* Fraud detected. Report and do not continue with login */
-                duo_log(LOG_WARNING, "Aborted fraudulent Duo login. Incident reported.",
-                    user, host, auth->ok.preauth.status_msg);
-                pam_err = PAM_ABORT;
-                break;
-        } else {
+            /* Fraud detected. Report and do not continue with login */
+            duo_log(LOG_WARNING, "Aborted fraudulent Duo login. Incident reported.",
+                user, host, auth->ok.preauth.status_msg);
+            pam_err = PAM_ABORT;
+            break;
+        } else if (strcmp(auth->ok.auth.status, "sent") == 0) {
+            duo_log(LOG_INFO, "Sent SMS to user", user, host, auth->ok.auth.status_msg);
+            pam_info(pamh, "%s", auth->ok.auth.status_msg);
+            i--; /* Do not consider the sms sending as a try */
+        } else if (strcmp(auth->ok.auth.status, "locked_out") == 0) {
+            duo_log(LOG_WARNING, "User locked out", user, host, auth->ok.auth.status_msg);
+            pam_err = PAM_ACCT_EXPIRED;
+            break;
+        } else if (strcmp(auth->ok.auth.status, "timeout") == 0) {
+            duo_log(LOG_WARNING, "Time out", user, host, auth->ok.auth.status_msg);
+            pam_err = PAM_AUTHTOK_EXPIRED;
+            break;
+        } else  {
             /* Try again */
             duo_log(LOG_WARNING, "Denied Duo login.", user, host, auth->ok.auth.status_msg);
         }
