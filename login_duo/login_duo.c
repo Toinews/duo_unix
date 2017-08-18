@@ -27,7 +27,11 @@
 
 #include "util.h"
 #include "duo.h"
-#include "shell.h"
+
+/* Which shell should we use by default if there's not one provided by getpwuid(3)? */
+#ifndef _DEFAULT_SHELL
+#define _DEFAULT_SHELL "/bin/sh"
+#endif
 
 #ifndef DUO_PRIVSEP_USER
 #define DUO_PRIVSEP_USER    "duo"
@@ -71,12 +75,6 @@ __ini_handler(void *u, const char *section, const char *name, const char *val)
     return (1);
 }
 
-static void
-__autopush_status_fn(void *arg, const char*msg)
-{
-    printf("%s\n", msg);
-}
-
 static int
 drop_privs(uid_t uid, gid_t gid)
 {
@@ -93,39 +91,19 @@ drop_privs(uid_t uid, gid_t gid)
 }
 
 static int
-_print_motd()
-{
-    FILE *fp;
-    size_t nbytes = 80;
-    char read[nbytes];
-    size_t result;
-
-    if ((fp = fopen(MOTD_FILE, "r")) == NULL) {
-        return (-1);
-    }
-
-    while ((result = fread(read, sizeof(char), nbytes, fp))) {
-        /* Save fwrite return value into result to prevent compiler warning */
-        result = fwrite(read, sizeof(char), result, stdout);
-    }
-    fclose(fp);
-
-    return (0);
-}
-
-static int
 do_auth(struct login_ctx *ctx, const char *cmd)
 {
     struct duo_config cfg;
     struct passwd *pw;
     struct in_addr addr;
     duo_t *duo;
-    duo_code_t code;
-    const char *config, *p, *duouser;
+    const char *config, *duouser;
     const char *ip, *host = NULL;
     char buf[64];
-    int i, flags, ret, prompts, matched;
-    int headless = 0;
+    int i, ret, prompts, matched;
+    duo_auth_t preauth =NULL, auth = NULL;
+    struct duo_factor *f = NULL;
+    char *factor = NULL;
 
     /*
      * Handle a delimited GECOS field. E.g.
@@ -143,7 +121,6 @@ do_auth(struct login_ctx *ctx, const char *cmd)
 
     duouser = ctx->duouser ? ctx->duouser : pw->pw_name;
     config = ctx->config ? ctx->config : DUO_CONF;
-    flags = 0;
 
     duo_config_default(&cfg);
 
@@ -218,84 +195,125 @@ do_auth(struct login_ctx *ctx, const char *cmd)
     }
 
     /* Try Duo auth. */
-    if ((duo = duo_open(cfg.apihost, cfg.ikey, cfg.skey,
+    if ((duo = duo_init(cfg.apihost, cfg.ikey, cfg.skey,
                     "login_duo/" PACKAGE_VERSION,
                     cfg.noverify ? "" : cfg.cafile,
-                    cfg.https_timeout, cfg.http_proxy)) == NULL) {
+                    cfg.http_proxy)) == NULL) {
         duo_log(LOG_ERR, "Couldn't open Duo API handle",
             pw->pw_name, host, NULL);
         close_config(&cfg);
         return (EXIT_FAILURE);
     }
 
-    /* Special handling for non-interactive sessions */
-    if ((p = getenv("SSH_ORIGINAL_COMMAND")) != NULL ||
-        !isatty(STDIN_FILENO)) {
-        /* Try to support automatic one-shot login */
-        duo_set_conv_funcs(duo, NULL, NULL, NULL);
-        flags = (DUO_FLAG_SYNC|DUO_FLAG_AUTO);
-        prompts = 1;
-        headless = 1;
-    } else if (cfg.autopush) { /* Special handling for autopush */
-        duo_set_conv_funcs(duo, NULL, __autopush_status_fn, NULL);
-        flags = (DUO_FLAG_SYNC|DUO_FLAG_AUTO);
+    auth = duo_auth_check(duo);
+    if (auth == NULL || auth->stat != DUO_OK) {
+        /* Duo endpoint not available. */
+        if (auth)
+            auth = duo_auth_free(auth);
+        if (cfg.failmode == DUO_FAIL_SAFE) 
+            return EXIT_SUCCESS;
+        else
+            return EXIT_FAILURE;
+
+    }
+    auth = duo_auth_free(auth);
+    /* Perform preauth check */
+    preauth = duo_auth_preauth(duo, duouser);
+    if (preauth == NULL || preauth->stat != DUO_OK) {
+        /* Duo endpoint not available. */
+        duo_log(LOG_ERR, "Cannot Preauth user", duouser, host, preauth->ok.preauth.status_msg);
+        ret = cfg.failmode == DUO_FAIL_SAFE ? EXIT_SUCCESS : EXIT_FAILURE;
+        goto cleanup;
     }
 
-    if (cfg.accept_env) {
-        flags |= DUO_FLAG_ENV;
+    if (strcmp(preauth->ok.preauth.result, "allow") == 0) {
+        /* No need to process to auth. User allowed to bypass */
+        duo_log(LOG_WARNING, "Skipped Duo login", duouser, host, preauth->ok.preauth.status_msg);
+        ret = EXIT_SUCCESS;
+        goto cleanup;
+    } else if (strcmp(preauth->ok.preauth.result, "auth") == 0) {
+       ; /* We will handle this case later */
+    } else {
+        /* enroll or deny, deny access */
+        duo_log(LOG_WARNING, "User not allowed to login.", duouser, host, preauth->ok.preauth.status_msg);
+        ret = EXIT_FAILURE;
+        goto cleanup;
     }
 
     ret = EXIT_FAILURE;
 
+    /* Perform Duo authentication */
     for (i = 0; i < prompts; i++) {
-        code = duo_login(duo, duouser, host, flags,
-                    cfg.pushinfo ? cmd : NULL);
-        if (code == DUO_FAIL) {
-            duo_log(LOG_WARNING, "Failed Duo login",
-                duouser, host, duo_geterr(duo));
-            if ((flags & DUO_FLAG_SYNC) == 0) {
-                printf("\n");
-            }
-            /* The autopush failed, fall back to regular process */
-            if (cfg.autopush && i == 0) {
-                flags = 0;
-                duo_reset_conv_funcs(duo);
-            }
-            /* Keep going */
-            continue;
+        if (auth) {
+            auth = duo_auth_free(auth);
         }
-        /* Terminal conditions */
-        if (code == DUO_OK) {
-            if ((p = duo_geterr(duo)) != NULL) {
-                duo_log(LOG_WARNING, "Skipped Duo login",
-                    duouser, host, p);
-            } else {
-                duo_log(LOG_INFO, "Successful Duo login",
-                    duouser, host, NULL);
-            }
-            if (cfg.motd && !headless) {
-                _print_motd();
-            }
-            ret = EXIT_SUCCESS;
-        } else if (code == DUO_ABORT) {
-            duo_log(LOG_WARNING, "Aborted Duo login",
-                duouser, host, duo_geterr(duo));
-        } else if (cfg.failmode == DUO_FAIL_SAFE &&
-                    (code == DUO_CONN_ERROR ||
-                     code == DUO_CLIENT_ERROR || code == DUO_SERVER_ERROR)) {
-            duo_log(LOG_WARNING, "Failsafe Duo login",
-                duouser, host, duo_geterr(duo));
-                        ret = EXIT_SUCCESS;
-        } else {
-            duo_log(LOG_ERR, "Error in Duo login",
-                duouser, host, duo_geterr(duo));
+        if (factor) {
+            free(factor);
+            factor = NULL;
         }
-        break;
-    }
-    duo_close(duo);
-    close_config(&cfg);
 
-    return (ret);
+        if (!cfg.autopush)
+        {
+            while (factor == NULL) {
+                /* Prompt for user input */
+                printf("%s", preauth->ok.preauth.prompt.text);
+                fflush(stdout);
+                if (fgets(buf, sizeof(buf), stdin) == NULL) {
+                        exit(1);
+                }
+                strtok(buf, "\r\n");
+                for (i = 0; i < preauth->ok.preauth.prompt.factors_cnt; i++) {
+                    f = &preauth->ok.preauth.prompt.factors[i];
+                    if (strcmp(buf, f->option) == 0) {
+                        factor = strdup(f->label);
+                        break;
+                    }
+                }
+                if (factor == NULL)
+                    factor = strdup(buf);
+            }
+        }
+
+        if (cfg.autopush) {
+            auth = duo_auth_auth(duo, duouser, "push" , ip, NULL);
+        } else {
+            auth = duo_auth_auth(duo, duouser, "prompt" , ip, factor);
+        }
+        if (auth == NULL || auth->stat != DUO_OK) {
+            /* Something went wrong with server and/or request */
+            ret = EXIT_FAILURE;
+            break;
+        }
+        if (strcmp(auth->ok.auth.result, "allow") == 0) {
+            duo_log(LOG_INFO, "Successful Duo login.", duouser, host, auth->ok.auth.status_msg);
+            ret = EXIT_FAILURE;
+            break;
+        }
+        else if (strcmp(auth->ok.auth.status, "fraud") == 0) {
+                /* Fraud detected. Report and do not continue with login */
+                duo_log(LOG_WARNING, "Aborted fraudulent Duo login. Incident reported.",
+                    duouser, host, auth->ok.preauth.status_msg);
+                ret = EXIT_FAILURE;
+                break;
+        } else {
+            /* Try again */
+            duo_log(LOG_WARNING, "Denied Duo login.", duouser, host, auth->ok.auth.status_msg);
+        }
+    }
+
+cleanup:
+    if (factor) {
+        free(factor);
+        factor = NULL;
+    }
+    if (auth)
+        auth = duo_auth_free(auth);
+    if (preauth)
+        auth = duo_auth_free(preauth);
+    if (duo)
+        duo = duo_close(duo);
+    close_config(&cfg);
+    return ret;
 }
 
 static char *
