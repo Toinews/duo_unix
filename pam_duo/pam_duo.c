@@ -104,7 +104,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
     const char *config = NULL, *host = NULL;
     char *pam_buf = NULL;
 
-    int i, pam_err, matched;
+    int i, j, pam_err, matched;
 
     /*
      * Handle a delimited GECOS field. E.g.
@@ -269,8 +269,13 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
     pam_err = PAM_PERM_DENIED;
 
     for (i = 0; i < cfg.prompts; i++) {
+        pam_info(pamh, "test");
         if (auth) {
             auth = duo_auth_free(auth);
+        }
+        if (factor) {
+            free(factor);
+            factor = NULL;
         }
 
         if (!cfg.autopush)
@@ -281,8 +286,8 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
                     continue;
                 }
 
-                for (i = 0; i < preauth->ok.preauth.prompt.factors_cnt; i++) {
-                    f = &preauth->ok.preauth.prompt.factors[i];
+                for (j = 0; j < preauth->ok.preauth.prompt.factors_cnt; j++) {
+                    f = &preauth->ok.preauth.prompt.factors[j];
                     if (strcmp(pam_buf, f->option) == 0) {
                         factor = strdup(f->label);
                         break;
@@ -321,7 +326,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
             duo_log(LOG_WARNING, "Denied Duo login.", user, host, auth->ok.auth.status_msg);
         }
     }
-    if (i == MAX_PROMPTS) {
+    if (i == cfg.prompts) {
         pam_err = PAM_MAXTRIES;
     }
 
