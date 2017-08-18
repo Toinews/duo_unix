@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "util.h"
+#include "ini.h"
 #include "groupaccess.h"
 
 int duo_debug = 0;
@@ -44,6 +45,7 @@ duo_set_boolean_option(const char *val)
         return (0);
     }
 }
+
 int
 duo_parse_config(const char *filename,
     int (*callback)(void *arg, const char *section,
