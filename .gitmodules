@@ -1,0 +1,3 @@
+[submodule "libduo"]
+	path = libduo
+	url = https://github.com/Toinews/libduo
