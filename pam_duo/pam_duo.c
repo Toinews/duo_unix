@@ -89,7 +89,9 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
     struct passwd *pw = NULL;
     struct in_addr addr;
     duo_t *duo = NULL;
-    duo_auth_t auth = NULL;
+    duo_auth_t preauth =NULL, auth = NULL;
+    struct duo_factor *f = NULL;
+    char *factor = NULL;
 
     /*
      * Only variables that will be passed to a pam_* function
@@ -100,6 +102,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
      */
     duopam_const char *ip = NULL, *service = NULL, *user = NULL;
     const char *config = NULL, *host = NULL;
+    char *pam_buf = NULL;
 
     int i, pam_err, matched;
 
@@ -128,6 +131,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
             return (PAM_SERVICE_ERR);
         }
     }
+
     i = duo_parse_config(config, __ini_handler, &cfg);
     if (i == -2) {
         duo_syslog(LOG_ERR, "%s must be readable only by user 'root'",
@@ -233,30 +237,31 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
     auth = duo_auth_check(duo);
     if (auth == NULL || auth->stat != DUO_OK) {
         /* Duo endpoint not available. */
+        duo_log(LOG_ERR, "Duo endpoint not ready.", user, host, auth->ok.preauth.status_msg);
         pam_err = cfg.failmode == DUO_FAIL_SAFE ? PAM_SUCCESS : PAM_SERVICE_ERR;
         goto cleanup;
     }
 
     auth = duo_auth_free(auth);
     /* Perform preauth check */
-    auth = duo_auth_preauth(duo, user);
-    if (auth == NULL || auth->stat != DUO_OK) {
+    preauth = duo_auth_preauth(duo, user);
+    if (preauth == NULL || preauth->stat != DUO_OK) {
         /* Duo endpoint not available. */
+        duo_log(LOG_ERR, "Cannot Preauth user", user, host, preauth->ok.preauth.status_msg);
         pam_err = cfg.failmode == DUO_FAIL_SAFE ? PAM_SUCCESS : PAM_SERVICE_ERR;
         goto cleanup;
     }
 
-    if (strcmp(auth->ok.preauth.result, "allow") == 0) {
+    if (strcmp(preauth->ok.preauth.result, "allow") == 0) {
         /* No need to process to auth. User allowed to bypass */
-        duo_log(LOG_WARNING, "Skipped Duo login", user, host, auth->ok.preauth.status_msg);
+        duo_log(LOG_WARNING, "Skipped Duo login", user, host, preauth->ok.preauth.status_msg);
         pam_err = PAM_SUCCESS;
         goto cleanup;
-    } else if (strcmp(auth->ok.preauth.result, "auth") == 0) {
-        /* Handle auth device and factor here ?*/
-        ;
+    } else if (strcmp(preauth->ok.preauth.result, "auth") == 0) {
+       ;
     } else {
         /* enroll or deny, deny access */
-        duo_log(LOG_WARNING, "User not allowed to login.", user, host, auth->ok.preauth.status_msg);
+        duo_log(LOG_WARNING, "User not allowed to login.", user, host, preauth->ok.preauth.status_msg);
         pam_err = PAM_PERM_DENIED;
         goto cleanup;
     }
@@ -268,7 +273,33 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
             auth = duo_auth_free(auth);
         }
 
-        auth = duo_auth_auth(duo, user, "push", NULL, NULL);
+        if (!cfg.autopush)
+        {
+            while (factor == NULL) {
+                if (pam_prompt(pamh, PAM_PROMPT_ECHO_ON, &pam_buf,
+                    "%s", preauth->ok.preauth.prompt.text) != PAM_SUCCESS || pam_buf == NULL) {
+                    continue;
+                }
+
+                for (i = 0; i < preauth->ok.preauth.prompt.factors_cnt; i++) {
+                    f = &preauth->ok.preauth.prompt.factors[i];
+                    if (strcmp(pam_buf, f->option) == 0) {
+                        factor = strdup(f->label);
+                        break;
+                    }
+                }
+                if (factor == NULL)
+                    factor = strdup(pam_buf);
+            }
+            free(pam_buf);
+            pam_buf = NULL;
+        }
+
+        if (cfg.autopush) {
+            auth = duo_auth_auth(duo, user, "push" , ip, NULL);
+        } else {
+            auth = duo_auth_auth(duo, user, "prompt" , ip, factor);
+        }
         if (auth == NULL || auth->stat != DUO_OK) {
             /* Something went wrong with server and/or request */
             pam_err = PAM_SERVICE_ERR;
@@ -297,10 +328,12 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
 cleanup:
     if (auth)
         auth = duo_auth_free(auth);
+    if (preauth)
+        auth = duo_auth_free(preauth);
     if (duo)
         duo = duo_close(duo);
     close_config(&cfg);
-    
+
     return pam_err;
 }
 
